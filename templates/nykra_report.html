@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>seo audit & strategy — {{client_name}}</title>
+
+<!-- Inter Tight -->
+<link href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+<style>
+  :root{
+    --font-sans: "Inter Tight", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", sans-serif;
+    --text: #EDEDF2;
+    --muted: #A7A6B4;
+    --bg: #211B2D;
+    --surf: #2C1E40;
+    --surf2:#3B1C4A;
+    --nyk-tan:#FFA361;
+    --nyk-lav:#E8B4FC;
+    --border:#3a2a4a;
+    --radius:14px;
+    --gap:14px;
+    --page-margin:22mm;
+    --shadow: 0 6px 20px rgba(0,0,0,.35);
+  }
+  @page{ margin: var(--page-margin); }
+  html,body{ background: var(--bg); color: var(--text); }
+  body{ font-family: var(--font-sans); line-height:1.5; font-size:12.25pt; }
+  h1,h2,h3{ margin:0 0 10px; line-height:1.2; font-weight:600; text-transform:none; }
+  h1{ font-size:32pt; letter-spacing:-.5px; }
+  h2{ font-size:20pt; }
+  h3{ font-size:13.75pt; letter-spacing:.1px; color:var(--text); }
+  p{ margin:0 0 10px; }
+  .grad{
+    background: linear-gradient(90deg, var(--nyk-tan) 0%, var(--nyk-lav) 100%);
+    -webkit-background-clip:text; background-clip:text; -webkit-text-fill-color:transparent; color:transparent;
+  }
+  .muted{ color:var(--muted); }
+  .section{ margin:0 0 24px; page-break-inside: avoid; }
+  .card{ border:1px solid var(--border); border-radius:var(--radius);
+         background: linear-gradient(180deg, var(--surf) 0%, var(--surf2) 100%);
+         padding:14px; box-shadow:var(--shadow); }
+  .split{ display:grid; grid-template-columns:1fr 1fr; gap:var(--gap); }
+  .row{ display:flex; gap:var(--gap); flex-wrap:wrap; }
+  .kpis{ display:flex; gap:var(--gap); flex-wrap:wrap; }
+  .kpi{ flex:1 1 170px; min-width:170px; padding:14px; border-radius:var(--radius);
+        background: radial-gradient(160% 120% at 10% 0%, rgba(232,180,252,.15), rgba(255,163,97,.08)),
+                    linear-gradient(180deg, #2a1f3a, #231A2C);
+        border:1px solid var(--border); box-shadow:var(--shadow); }
+  .kpi b{ display:block; font-size:11pt; color:var(--muted); font-weight:500; }
+  .kpi .val{ font-size:18pt; font-weight:700; color:#fff; }
+  table{ width:100%; border-collapse:collapse; font-size:11.5pt; }
+  th,td{ border:1px solid var(--border); padding:8px 10px; text-align:left; vertical-align:top; }
+  th{ background: linear-gradient(90deg, rgba(255,163,97,.18), rgba(232,180,252,.18)); color:#fff; font-weight:600; }
+  tr:nth-child(even) td{ background: rgba(255,255,255,0.02); }
+  .pill{ display:inline-block; padding:3px 10px; border-radius:999px; background:rgba(232,180,252,.15);
+         color:var(--nyk-lav); font-weight:600; font-size:10pt; border:1px solid rgba(232,180,252,.3); }
+  .cover{ text-align:center; padding-top:110px; page-break-after:always;
+          background: radial-gradient(900px 400px at 50% -200px, rgba(232,180,252,.25), transparent),
+                      radial-gradient(900px 600px at 10% 0%, rgba(255,163,97,.12), transparent); }
+  .brandword{ font-size:42pt; font-weight:700; letter-spacing:-.8px; color:var(--nyk-tan); }
+  .logos{ display:flex; align-items:center; justify-content:center; gap:18px; margin:12px 0 0; }
+  .logos img{ height:24px; filter: drop-shadow(0 4px 18px rgba(232,180,252,.35)); }
+  .footer{ position:fixed; left:0; right:0; bottom:-10mm; text-align:center; font-size:10pt; color:var(--muted); }
+  .pb{ page-break-before: always; }
+</style>
+</head>
+<body>
+
+<section class="cover">
+  <div class="brandword">nykra studio.</div>
+  <h1 class="grad" style="margin-top:8px;">seo audit & growth strategy</h1>
+  <p class="muted">for <strong>{{client_name}}</strong></p>
+  <div class="logos">
+    <img src="{{your_logo_url}}" alt="Your Logo"/>
+    <span class="muted">×</span>
+    <img src="{{client_logo_url}}" alt="Client Logo"/>
+  </div>
+  <p class="muted" style="margin-top:8px;">generated: {{report_date}}</p>
+</section>
+
+<section class="section">
+  <h2 class="grad">executive summary</h2>
+  <div class="kpis">
+    <div class="kpi"><b>domain authority</b><div class="val">{{kpi.da}}</div></div>
+    <div class="kpi"><b>monthly organic visits</b><div class="val">{{kpi.organic_visits}}</div></div>
+    <div class="kpi"><b>ranking keywords</b><div class="val">{{kpi.keyword_count}}</div></div>
+    <div class="kpi"><b>site health</b><div class="val">{{kpi.health_score}}%</div></div>
+  </div>
+  <div class="card"><p>{{strategy.executive_summary}}</p></div>
+</section>
+
+<section class="section">
+  <h2 class="grad">core web vitals & technical audit</h2>
+  <div class="row">
+    <div class="card" style="flex:1 1 300px;">
+      <h3>vitals (client)</h3>
+      <table>
+        <tr><th>metric</th><th>value</th><th>status</th></tr>
+        <tr><td>LCP</td><td>{{sites.client.tech.lcp_ms}} ms</td><td>{{sites.client.tech.lcp_status}}</td></tr>
+        <tr><td>CLS</td><td>{{sites.client.tech.cls}}</td><td>{{sites.client.tech.cls_status}}</td></tr>
+        <tr><td>INP</td><td>{{sites.client.tech.inp_ms}} ms</td><td>{{sites.client.tech.inp_status}}</td></tr>
+      </table>
+    </div>
+    <div class="card" style="flex:1 1 300px;">
+      <h3>mobile / desktop</h3>
+      <table>
+        <tr><th>platform</th><th>passed</th></tr>
+        <tr><td>mobile</td><td>{{sites.client.tech.mobile_cwv_pass}}</td></tr>
+        <tr><td>desktop</td><td>{{sites.client.tech.desktop_cwv_pass}}</td></tr>
+      </table>
+    </div>
+  </div>
+  <div class="card" style="margin-top:14px;">
+    <h3>quick wins</h3>
+    <table>
+      <tr><th>issue</th><th>evidence</th><th>fix</th><th>impact</th><th>eta</th></tr>
+      {{#each strategy.quick_wins}}
+        <tr>
+          <td>{{issue}}</td>
+          <td>{{evidence_metric}}: {{evidence_value}}</td>
+          <td>{{fix}}</td>
+          <td>{{impact}}</td>
+          <td>{{eta_days}}d</td>
+        </tr>
+      {{/each}}
+    </table>
+  </div>
+</section>
+
+<section class="section pb">
+  <h2 class="grad">keyword performance & gaps</h2>
+  <div class="split">
+    <div class="card">
+      <h3>top keywords</h3>
+      <table>
+        <tr><th>keyword</th><th>rank</th><th>volume</th><th>url</th></tr>
+        {{#each keywords.top}}
+          <tr><td>{{kw}}</td><td>{{pos}}</td><td>{{vol}}</td><td>{{url}}</td></tr>
+        {{/each}}
+      </table>
+    </div>
+    <div class="card">
+      <h3>competitor gaps</h3>
+      <table>
+        <tr><th>keyword</th><th>client</th><th>comp a</th><th>comp b</th></tr>
+        {{#each keywords.gaps}}
+          <tr><td>{{kw}}</td><td>{{client_rank}}</td><td>{{comp1_rank}}</td><td>{{comp2_rank}}</td></tr>
+        {{/each}}
+      </table>
+    </div>
+  </div>
+</section>
+
+<section class="section">
+  <h2 class="grad">on-page seo audit</h2>
+  <div class="card">
+    <table>
+      <tr><th>url</th><th>issue</th><th>suggested fix</th></tr>
+      {{#each on_page.issues}}
+        <tr><td>{{url}}</td><td>{{issue}}</td><td>{{fix}}</td></tr>
+      {{/each}}
+    </table>
+  </div>
+  <div class="card">
+    <h3>example rewrites</h3>
+    <table>
+      <tr><th>url</th><th>title</th><th>meta description</th></tr>
+      {{#each on_page.rewrites}}
+        <tr><td>{{url}}</td><td>{{example_title}}</td><td>{{example_meta}}</td></tr>
+      {{/each}}
+    </table>
+  </div>
+</section>
+
+<section class="section">
+  <h2 class="grad">backlink profile</h2>
+  <div class="kpis">
+    <div class="kpi"><b>ref. domains</b><div class="val">{{backlinks.ref_domains}}</div></div>
+    <div class="kpi"><b>total links</b><div class="val">{{backlinks.total}}</div></div>
+  </div>
+  <div class="card">
+    <table>
+      <tr><th>domain</th><th>type</th><th>auth</th><th>link type</th></tr>
+      {{#each backlinks.top_domains}}
+        <tr><td>{{domain}}</td><td>{{type}}</td><td>{{authority}}</td><td>{{link_type}}</td></tr>
+      {{/each}}
+    </table>
+  </div>
+  <div class="card">
+    <h3>link-building strategy</h3>
+    <p>{{strategy.backlinks.strategy}}</p>
+    <ul>
+      {{#each strategy.backlinks.prospects}}
+        <li><span class="pill">{{type}}</span> — {{why}}</li>
+      {{/each}}
+    </ul>
+  </div>
+</section>
+
+<section class="section pb">
+  <h2 class="grad">content strategy plan (8–12 ideas)</h2>
+  <div class="card" style="background:linear-gradient(180deg,#261c34,#221a2f)">
+    <div class="row" style="flex-direction:column;gap:12px;">
+      {{#each strategy.content_plan}}
+        <div class="card" style="background:#231a2f;border-color:#3a2a4a;">
+          <b>{{topic}}</b> — {{intent}} • target: {{target_kw}}<br/>
+          H1: {{h1}}<br/>
+          Outline:
+          <ul>
+            {{#each outline}}<li>{{this}}</li>{{/each}}
+          </ul>
+          Internal Links:
+          {{#each internal_links}}<code style="color:#DDD">{{this}}</code> {{/each}}
+        </div>
+      {{/each}}
+    </div>
+  </div>
+</section>
+
+<section class="section">
+  <h2 class="grad">competitor benchmark</h2>
+  <div class="card">
+    <table>
+      <tr><th>metric</th><th>client</th><th>comp a</th><th>comp b</th></tr>
+      <tr><td>site health</td><td>{{bench.client.health}}</td><td>{{bench.comp1.health}}</td><td>{{bench.comp2.health}}</td></tr>
+      <tr><td>DA</td><td>{{bench.client.da}}</td><td>{{bench.comp1.da}}</td><td>{{bench.comp2.da}}</td></tr>
+      <tr><td>organic traffic</td><td>{{bench.client.traffic}}</td><td>{{bench.comp1.traffic}}</td><td>{{bench.comp2.traffic}}</td></tr>
+      <tr><td>ranking keywords</td><td>{{bench.client.kw}}</td><td>{{bench.comp1.kw}}</td><td>{{bench.comp2.kw}}</td></tr>
+    </table>
+  </div>
+  <div class="card">
+    <h3>commentary</h3>
+    <p>{{strategy.competitor_commentary}}</p>
+  </div>
+</section>
+
+<section class="section">
+  <h2 class="grad">roadmap & timeline</h2>
+  <div class="split">
+    <div class="card"><h3>month 1</h3><ul>{{#each strategy.roadmap.month_1}}<li>{{this}}</li>{{/each}}</ul></div>
+    <div class="card"><h3>month 3</h3><ul>{{#each strategy.roadmap.month_3}}<li>{{this}}</li>{{/each}}</ul></div>
+  </div>
+  <div class="card" style="margin-top:14px;"><h3>month 6</h3><ul>{{#each strategy.roadmap.month_6}}<li>{{this}}</li>{{/each}}</ul></div>
+</section>
+
+<section class="section pb">
+  <h2 class="grad">next steps</h2>
+  <div class="card">
+    <p><strong>ready to implement?</strong> book an implementation call: <a href="{{cta_url}}" style="color:var(--nyk-lav);">{{cta_url}}</a><br/>
+    contact: <a href="mailto:{{contact_email}}" style="color:var(--nyk-tan);">{{contact_email}}</a></p>
+  </div>
+</section>
+
+<div class="footer">© {{year}} nykra studio — {{client_name}} seo strategy</div>
+</body>
+</html>

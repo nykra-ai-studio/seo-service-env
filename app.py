@@ -92,7 +92,7 @@ def render_template_with_data(data: dict) -> str:
     return renderer.render(html_template, data)
 
 def psi_fetch(url: str, strategy: str, api_key: str) -> dict:
-    """Fetch core vitals from Google PageSpeed Insights."""
+    """Fetch Core Web Vitals from Google PageSpeed Insights (robust INP extraction)."""
     resp = requests.get(
         "https://www.googleapis.com/pagespeedonline/v5/runPagespeed",
         params={"url": url, "strategy": strategy, "category": "PERFORMANCE", "key": api_key},
@@ -102,23 +102,24 @@ def psi_fetch(url: str, strategy: str, api_key: str) -> dict:
     j = resp.json()
     audits = j.get("lighthouseResult", {}).get("audits", {})
 
-    def num(audit_key):
-        v = audits.get(audit_key, {}).get("numericValue")
+    def num(key):
+        v = audits.get(key, {}).get("numericValue")
         return float(v) if isinstance(v, (int, float)) else None
 
     lcp = num("largest-contentful-paint")
-    # INP is not always present in PSI JSON; fall back gracefully
-    inp = num("interactive") or num("total-blocking-time")
+    # Try real INP first, then fall back gracefully
+    inp = (num("experimental-interaction-to-next-paint")
+           or num("interaction-to-next-paint")
+           or num("total-blocking-time")
+           or num("interactive"))
     cls = audits.get("cumulative-layout-shift", {}).get("numericValue", None)
 
     def status_lcp(v):
         if v is None: return "fail"
-        v = v  # milliseconds
         return "pass" if v <= 2500 else "needs improvement" if v <= 4000 else "fail"
 
     def status_inp(v):
         if v is None: return "fail"
-        # We treat 'interactive' ms as a proxy if INP missing (strict INP pass is ~<=200ms)
         return "pass" if v <= 200 else "needs improvement" if v <= 500 else "fail"
 
     def status_cls(v):

@@ -1,13 +1,17 @@
 import os, json, pathlib
-from flask import Flask, Response
-import pystache  # make sure 'pystache' is in requirements.txt
+from flask import Flask, Response, request
+import pystache                  # ensure 'pystache' is in requirements.txt
+import requests                  # ensure 'requests' is in requirements.txt
+from urllib.parse import urlparse
 
 app = Flask(__name__)
 
 TEMPLATE_PATH = pathlib.Path("templates/nykra_report.html").resolve()
 
+# ---------------------------
+# Payload used for demo & as a base we overwrite with real data
+# ---------------------------
 def demo_payload():
-    # Minimal but realistic payload to light up all sections
     return {
         "client_name": "hellogreenhomes.com",
         "your_logo_url": "https://via.placeholder.com/140x40?text=nykra",
@@ -77,18 +81,105 @@ def demo_payload():
         }
     }
 
+# ---------------------------
+# Helpers
+# ---------------------------
+def render_template_with_data(data: dict) -> str:
+    if not TEMPLATE_PATH.exists():
+        return "Template not found. Create templates/nykra_report.html"
+    html_template = TEMPLATE_PATH.read_text(encoding="utf-8")
+    renderer = pystache.Renderer(escape=lambda u: u)  # don't escape; template is trusted
+    return renderer.render(html_template, data)
+
+def psi_fetch(url: str, strategy: str, api_key: str) -> dict:
+    """Fetch core vitals from Google PageSpeed Insights."""
+    resp = requests.get(
+        "https://www.googleapis.com/pagespeedonline/v5/runPagespeed",
+        params={"url": url, "strategy": strategy, "category": "PERFORMANCE", "key": api_key},
+        timeout=60
+    )
+    resp.raise_for_status()
+    j = resp.json()
+    audits = j.get("lighthouseResult", {}).get("audits", {})
+
+    def num(audit_key):
+        v = audits.get(audit_key, {}).get("numericValue")
+        return float(v) if isinstance(v, (int, float)) else None
+
+    lcp = num("largest-contentful-paint")
+    # INP is not always present in PSI JSON; fall back gracefully
+    inp = num("interactive") or num("total-blocking-time")
+    cls = audits.get("cumulative-layout-shift", {}).get("numericValue", None)
+
+    def status_lcp(v):
+        if v is None: return "fail"
+        v = v  # milliseconds
+        return "pass" if v <= 2500 else "needs improvement" if v <= 4000 else "fail"
+
+    def status_inp(v):
+        if v is None: return "fail"
+        # We treat 'interactive' ms as a proxy if INP missing (strict INP pass is ~<=200ms)
+        return "pass" if v <= 200 else "needs improvement" if v <= 500 else "fail"
+
+    def status_cls(v):
+        if v is None: return "fail"
+        return "pass" if v <= 0.1 else "needs improvement" if v <= 0.25 else "fail"
+
+    return {
+        "lcp_ms": int(round(lcp)) if isinstance(lcp, (int, float)) else 0,
+        "lcp_status": status_lcp(lcp),
+        "inp_ms": int(round(inp)) if isinstance(inp, (int, float)) else 0,
+        "inp_status": status_inp(inp),
+        "cls": round(cls, 3) if isinstance(cls, (int, float)) else 0.0,
+        "cls_status": status_cls(cls),
+    }
+
+# ---------------------------
+# Routes
+# ---------------------------
 @app.route("/")
 def home():
     return "SEO service is running!"
 
 @app.route("/report/demo")
 def report_demo():
-    if not TEMPLATE_PATH.exists():
-        return "Template not found. Create templates/nykra_report.html", 500
-    html_template = TEMPLATE_PATH.read_text(encoding="utf-8")
-    # Do not escape because template contains HTML and we trust our own placeholders
-    renderer = pystache.Renderer(escape=lambda u: u)
-    filled_html = renderer.render(html_template, demo_payload())
+    filled_html = render_template_with_data(demo_payload())
+    if filled_html.startswith("Template not found"):
+        return filled_html, 500
+    return Response(filled_html, mimetype="text/html")
+
+@app.route("/report/psi")
+def report_psi():
+    """Renders the report with live Core Web Vitals for ?url=... using PSI."""
+    api_key = os.getenv("GOOGLE_PAGESPEED_API_KEY")
+    if not api_key:
+        return "Missing GOOGLE_PAGESPEED_API_KEY", 500
+
+    raw_url = request.args.get("url", "").strip()
+    if not raw_url:
+        return "Add ?url=https://example.com", 400
+    if not urlparse(raw_url).scheme:
+        raw_url = "https://" + raw_url  # ensure scheme
+
+    # Fetch PSI for both strategies
+    tech_mobile = psi_fetch(raw_url, "mobile", api_key)
+    tech_desktop = psi_fetch(raw_url, "desktop", api_key)
+
+    data = demo_payload()
+    data["client_name"] = raw_url
+    data["sites"]["client"]["tech"] = {
+        **tech_mobile,
+        "mobile_cwv_pass": "true" if all(
+            tech_mobile[k] == "pass" for k in ("lcp_status", "inp_status", "cls_status")
+        ) else "false",
+        "desktop_cwv_pass": "true" if all(
+            tech_desktop[k] == "pass" for k in ("lcp_status", "inp_status", "cls_status")
+        ) else "false",
+    }
+
+    filled_html = render_template_with_data(data)
+    if filled_html.startswith("Template not found"):
+        return filled_html, 500
     return Response(filled_html, mimetype="text/html")
 
 # Local debug (Render uses gunicorn via Procfile)

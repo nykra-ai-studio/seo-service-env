@@ -1,2 +1,28 @@
+# Web app
 flask
 gunicorn
+flask-cors
+
+# HTTP + parsing
+requests
+beautifulsoup4
+lxml
+
+# Data wrangling
+pandas
+numpy
+
+# HTML templating (to render your report HTML from JSON)
+pystache   # Mustache engine (matches your {{ }} + {{#each}} style)
+
+# Google APIs (only needed if you’ll use Search Console OAuth now)
+google-api-python-client
+google-auth
+google-auth-httplib2
+google-auth-oauthlib
+
+# (Optional) Trends helper if you’ll pull Google Trends quickly
+pytrends
+
+# (Optional) Azure Vision SDK if you really plan to call it
+azure-ai-vision

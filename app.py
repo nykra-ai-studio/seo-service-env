@@ -1,10 +1,12 @@
 import os, json, pathlib, re
-from flask import Flask, Response, request
+from flask import Flask, Response, request, jsonify
+from flask_cors import CORS
 import pystache                  # ensure 'pystache' is in requirements.txt
 import requests                  # ensure 'requests' is in requirements.txt
 from urllib.parse import urlparse
 
 app = Flask(__name__)
+CORS(app)  # Enable CORS for n8n
 
 TEMPLATE_PATH = pathlib.Path("templates/nykra_report.html").resolve()
 
@@ -116,6 +118,11 @@ def render_template_with_data(data: dict) -> str:
     renderer = pystache.Renderer(escape=lambda u: u)  # don't escape; template is trusted
     return renderer.render(html_template, data)
 
+def validate_payload(data: dict):
+    """Minimal sanity check; expand later as needed"""
+    required = ["client_name", "sites", "strategy"]
+    return [k for k in required if k not in data]
+
 def psi_fetch(url: str, strategy: str, api_key: str) -> dict:
     """Fetch Core Web Vitals from Google PageSpeed Insights (robust INP extraction)."""
     resp = requests.get(
@@ -208,7 +215,23 @@ def report_psi():
         return filled_html, 500
     return Response(filled_html, mimetype="text/html")
 
+@app.route("/report/render", methods=["POST"])
+def report_render():
+    """Generic renderer endpoint for n8n - accepts full JSON payload and returns HTML"""
+    if not request.is_json:
+        return "Send JSON body", 400
+    
+    data = request.get_json(silent=True) or {}
+    missing = validate_payload(data)
+    if missing:
+        return jsonify({"error": "missing fields", "fields": missing}), 400
+
+    filled_html = render_template_with_data(data)
+    if filled_html.startswith("Template not found"):
+        return filled_html, 500
+    
+    return Response(filled_html, mimetype="text/html")
+
 # Local debug (Render uses gunicorn via Procfile)
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
-

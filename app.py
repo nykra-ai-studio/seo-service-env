@@ -1,4 +1,4 @@
-import os, json, pathlib
+import os, json, pathlib, re
 from flask import Flask, Response, request
 import pystache                  # ensure 'pystache' is in requirements.txt
 import requests                  # ensure 'requests' is in requirements.txt
@@ -7,6 +7,29 @@ from urllib.parse import urlparse
 app = Flask(__name__)
 
 TEMPLATE_PATH = pathlib.Path("templates/nykra_report.html").resolve()
+
+# ---------- Handlebars → Mustache normalizer ----------
+def normalize_handlebars_each_to_mustache(html: str) -> str:
+    """
+    Convert {{#each foo.bar}} ... {{/each}} blocks into Mustache sections:
+    -> {{#foo.bar}} ... {{/foo.bar}}
+    Works with nested each blocks via a small stack.
+    """
+    out, i, stack = [], 0, []
+    token_re = re.compile(r"(\{\{\#each\s+[^}]+\}\}|\{\{\/each\}\})")
+    for m in token_re.finditer(html):
+        out.append(html[i:m.start()])
+        tok = m.group(0)
+        if tok.startswith("{{#each"):
+            name = tok[len("{{#each"): -2].strip()
+            stack.append(name)
+            out.append("{{#" + name + "}}")
+        else:  # {{/each}}
+            name = stack.pop() if stack else ""
+            out.append("{{/" + name + "}}")
+        i = m.end()
+    out.append(html[i:])
+    return "".join(out)
 
 # ---------------------------
 # Payload used for demo & as a base we overwrite with real data
@@ -88,6 +111,8 @@ def render_template_with_data(data: dict) -> str:
     if not TEMPLATE_PATH.exists():
         return "Template not found. Create templates/nykra_report.html"
     html_template = TEMPLATE_PATH.read_text(encoding="utf-8")
+    # normalize {{#each ...}} … {{/each}} to Mustache sections
+    html_template = normalize_handlebars_each_to_mustache(html_template)
     renderer = pystache.Renderer(escape=lambda u: u)  # don't escape; template is trusted
     return renderer.render(html_template, data)
 
@@ -186,3 +211,4 @@ def report_psi():
 # Local debug (Render uses gunicorn via Procfile)
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
+

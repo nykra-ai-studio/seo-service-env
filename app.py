@@ -3,6 +3,7 @@ import json
 import pathlib
 import re
 import time
+import concurrent.futures
 from datetime import datetime
 from typing import Dict, List, Any, Optional, Tuple
 from urllib.parse import urlparse, quote_plus
@@ -11,13 +12,37 @@ from flask import Flask, Response, request, jsonify
 from flask_cors import CORS
 import pystache
 import requests
+from requests.adapters import HTTPAdapter
+from requests.packages.urllib3.util.retry import Retry
 import openai
 from pytrends.request import TrendReq
+
+# Note: Procfile should use gunicorn with --timeout 90 to allow for API calls with retries
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for n8n
 
 TEMPLATE_PATH = pathlib.Path("templates/nykra_report.html").resolve()
+
+# ---------- HTTP Sessions with Retries ----------
+def create_session(prefix: str, connect_timeout: int, read_timeout: int) -> requests.Session:
+    """Create a requests session with retries and timeouts"""
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=2,
+        backoff_factor=0.6,
+        status_forcelist=[429, 500, 502, 503, 504],
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    # Log session creation for debugging
+    print(f"[{prefix}] Created session with ({connect_timeout}, {read_timeout}) timeouts")
+    return session
+
+# Create service-specific sessions
+PSI_SESSION = create_session("PSI", 5, 12)
+SERPSTACK_SESSION = create_session("SERPSTACK", 5, 10)
 
 # ---------- Handlebars → Mustache normalizer ----------
 def normalize_handlebars_each_to_mustache(html: str) -> str:
@@ -47,11 +72,17 @@ def normalize_handlebars_each_to_mustache(html: str) -> str:
 # ---------------------------
 def psi_fetch(url: str, strategy: str, api_key: str) -> dict:
     """Fetch Core Web Vitals from Google PageSpeed Insights (robust INP extraction)."""
+    default_response = {
+        "lcp_ms": 0, "lcp_status": "fail",
+        "inp_ms": 0, "inp_status": "fail",
+        "cls": 0.0, "cls_status": "fail"
+    }
+    
     try:
-        resp = requests.get(
+        resp = PSI_SESSION.get(
             "https://www.googleapis.com/pagespeedonline/v5/runPagespeed",
             params={"url": url, "strategy": strategy, "category": "PERFORMANCE", "key": api_key},
-            timeout=60
+            timeout=(5, 12)  # (connect_timeout, read_timeout)
         )
         resp.raise_for_status()
         j = resp.json()
@@ -90,12 +121,37 @@ def psi_fetch(url: str, strategy: str, api_key: str) -> dict:
             "cls_status": status_cls(cls),
         }
     except Exception as e:
-        print(f"PSI API error: {e}")
-        return {
-            "lcp_ms": 0, "lcp_status": "fail",
-            "inp_ms": 0, "inp_status": "fail",
-            "cls": 0.0, "cls_status": "fail"
-        }
+        print(f"[PSI] API error ({strategy}): {e}")
+        return default_response
+
+def psi_fetch_parallel(url: str, api_key: str) -> Tuple[dict, dict]:
+    """Fetch PSI data for mobile and desktop in parallel using ThreadPoolExecutor."""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        mobile_future = executor.submit(psi_fetch, url, "mobile", api_key)
+        desktop_future = executor.submit(psi_fetch, url, "desktop", api_key)
+        
+        # Get results, with timeout protection
+        try:
+            mobile_result = mobile_future.result(timeout=15)
+        except (concurrent.futures.TimeoutError, Exception) as e:
+            print(f"[PSI] Mobile fetch timed out or failed: {e}")
+            mobile_result = {
+                "lcp_ms": 0, "lcp_status": "fail",
+                "inp_ms": 0, "inp_status": "fail",
+                "cls": 0.0, "cls_status": "fail"
+            }
+            
+        try:
+            desktop_result = desktop_future.result(timeout=15)
+        except (concurrent.futures.TimeoutError, Exception) as e:
+            print(f"[PSI] Desktop fetch timed out or failed: {e}")
+            desktop_result = {
+                "lcp_ms": 0, "lcp_status": "fail",
+                "inp_ms": 0, "inp_status": "fail",
+                "cls": 0.0, "cls_status": "fail"
+            }
+    
+    return mobile_result, desktop_result
 
 def serpstack_fetch_keywords(domain: str, api_key: str, limit: int = 10) -> List[Dict]:
     """Fetch top ranking keywords for a domain using Serpstack API."""
@@ -105,7 +161,7 @@ def serpstack_fetch_keywords(domain: str, api_key: str, limit: int = 10) -> List
         clean_domain = parsed_domain.netloc or parsed_domain.path.split('/')[0]
         
         # Fetch organic results for the domain
-        resp = requests.get(
+        resp = SERPSTACK_SESSION.get(
             "http://api.serpstack.com/search",
             params={
                 "access_key": api_key,
@@ -113,10 +169,15 @@ def serpstack_fetch_keywords(domain: str, api_key: str, limit: int = 10) -> List
                 "num": limit,
                 "output": "json"
             },
-            timeout=30
+            timeout=(5, 10)  # (connect_timeout, read_timeout)
         )
         resp.raise_for_status()
-        data = resp.json()
+        
+        try:
+            data = resp.json()
+        except json.JSONDecodeError as e:
+            print(f"[SERPSTACK] JSON decode error: {e}")
+            return []
         
         # Extract keywords from organic results
         keywords = []
@@ -145,8 +206,52 @@ def serpstack_fetch_keywords(domain: str, api_key: str, limit: int = 10) -> List
         
         return keywords[:limit]
     except Exception as e:
-        print(f"Serpstack API error: {e}")
+        print(f"[SERPSTACK] API error for domain {domain}: {e}")
         return []
+
+def fetch_keywords_parallel(client_url: str, comp1_url: Optional[str], comp2_url: Optional[str], 
+                           api_key: str) -> Tuple[List[Dict], List[Dict], List[Dict]]:
+    """Fetch keywords for client and competitors in parallel."""
+    client_keywords = []
+    comp1_keywords = []
+    comp2_keywords = []
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        # Always fetch client keywords
+        client_future = executor.submit(serpstack_fetch_keywords, client_url, api_key)
+        
+        # Conditionally fetch competitor keywords
+        comp1_future = None
+        comp2_future = None
+        
+        if comp1_url:
+            comp1_future = executor.submit(serpstack_fetch_keywords, comp1_url, api_key)
+        
+        if comp2_url:
+            comp2_future = executor.submit(serpstack_fetch_keywords, comp2_url, api_key)
+        
+        # Get results with timeout protection
+        try:
+            client_keywords = client_future.result(timeout=12)
+        except (concurrent.futures.TimeoutError, Exception) as e:
+            print(f"[SERPSTACK] Client keywords fetch timed out or failed: {e}")
+            client_keywords = []
+        
+        if comp1_future:
+            try:
+                comp1_keywords = comp1_future.result(timeout=12)
+            except (concurrent.futures.TimeoutError, Exception) as e:
+                print(f"[SERPSTACK] Competitor 1 keywords fetch timed out or failed: {e}")
+                comp1_keywords = []
+        
+        if comp2_future:
+            try:
+                comp2_keywords = comp2_future.result(timeout=12)
+            except (concurrent.futures.TimeoutError, Exception) as e:
+                print(f"[SERPSTACK] Competitor 2 keywords fetch timed out or failed: {e}")
+                comp2_keywords = []
+    
+    return client_keywords, comp1_keywords, comp2_keywords
 
 def get_keyword_gaps(client_keywords: List[Dict], comp1_keywords: List[Dict], 
                     comp2_keywords: List[Dict]) -> List[Dict]:
@@ -197,7 +302,8 @@ def get_trends_data(keywords: List[Dict], timeframe='today 12-m') -> List[Dict]:
         return []
         
     try:
-        pytrends = TrendReq(hl='en-US', tz=360)
+        # Set a short timeout for pytrends
+        pytrends = TrendReq(hl='en-US', tz=360, timeout=(3, 8))
         content_ideas = []
         
         # Use top 3 keywords to get related queries
@@ -223,25 +329,28 @@ def get_trends_data(keywords: List[Dict], timeframe='today 12-m') -> List[Dict]:
                             "target_kw": top_query,
                             "h1": h1,
                             "outline": ["Introduction", "Key Benefits", "Case Studies", "FAQ"],
-                            "internal_links": [kw_item["url"]]
+                            "internal_links": [kw_item.get("url", "/")]
                         })
             except Exception as e:
-                print(f"Error getting trends for {kw}: {e}")
+                print(f"[TRENDS] Error getting trends for {kw}: {e}")
                 continue
                 
         return content_ideas
     except Exception as e:
-        print(f"Google Trends error: {e}")
+        print(f"[TRENDS] Google Trends error: {e}")
         return []
 
 def generate_ai_summary(client_data: Dict, comp1_data: Dict, comp2_data: Dict) -> Dict:
     """Generate AI summaries based on actual data."""
     api_key = os.getenv("OPENAI_API_KEY")
+    default_response = {
+        "executive_summary": "Unable to generate summary. Using data-driven insights to improve your strategy.",
+        "competitor_commentary": "Competitor analysis unavailable. Focus on your core strengths and unique value proposition."
+    }
+    
     if not api_key:
-        return {
-            "executive_summary": "API key missing. Unable to generate summary.",
-            "competitor_commentary": "API key missing. Unable to generate commentary."
-        }
+        print("[AI] Missing OPENAI_API_KEY")
+        return default_response
     
     try:
         # Prepare data for the AI
@@ -296,7 +405,8 @@ def generate_ai_summary(client_data: Dict, comp1_data: Dict, comp2_data: Dict) -
             model="gpt-3.5-turbo",
             messages=[{"role": "user", "content": exec_prompt}],
             max_tokens=150,
-            temperature=0.7
+            temperature=0.7,
+            timeout=10  # 10 second timeout
         )
         
         # Generate competitor commentary
@@ -304,7 +414,8 @@ def generate_ai_summary(client_data: Dict, comp1_data: Dict, comp2_data: Dict) -
             model="gpt-3.5-turbo",
             messages=[{"role": "user", "content": comp_prompt}],
             max_tokens=100,
-            temperature=0.7
+            temperature=0.7,
+            timeout=10  # 10 second timeout
         )
         
         return {
@@ -312,11 +423,8 @@ def generate_ai_summary(client_data: Dict, comp1_data: Dict, comp2_data: Dict) -
             "competitor_commentary": comp_response.choices[0].message.content.strip()
         }
     except Exception as e:
-        print(f"AI summary generation error: {e}")
-        return {
-            "executive_summary": f"Error generating summary: {str(e)[:100]}",
-            "competitor_commentary": f"Error generating commentary: {str(e)[:100]}"
-        }
+        print(f"[AI] Summary generation error: {e}")
+        return default_response
 
 def generate_quick_wins(tech_data: Dict) -> List[Dict]:
     """Generate quick win recommendations based on Core Web Vitals data."""
@@ -492,7 +600,8 @@ def estimate_domain_metrics(keywords: List[Dict]) -> Dict:
 def fetch_on_page_issues(url: str) -> List[Dict]:
     """Identify basic on-page issues based on a simple fetch."""
     try:
-        resp = requests.get(url, timeout=10)
+        session = create_session("ONPAGE", 5, 8)
+        resp = session.get(url, timeout=(5, 8))
         html = resp.text.lower()
         
         issues = []
@@ -523,7 +632,7 @@ def fetch_on_page_issues(url: str) -> List[Dict]:
         
         return issues
     except Exception as e:
-        print(f"Error fetching on-page issues: {e}")
+        print(f"[ONPAGE] Error fetching on-page issues: {e}")
         return [{
             "url": "/",
             "issue": f"Error analyzing page: {str(e)[:100]}",
@@ -627,86 +736,136 @@ def fetch_all_data(client_url: str, comp1_url: Optional[str] = None, comp2_url: 
     if comp2_url and not urlparse(comp2_url).scheme:
         comp2_url = "https://" + comp2_url
     
-    # 1. Fetch Core Web Vitals
+    # 1. Fetch Core Web Vitals in parallel
     psi_api_key = os.getenv("GOOGLE_PAGESPEED_API_KEY")
     if psi_api_key:
-        tech_mobile = psi_fetch(client_url, "mobile", psi_api_key)
-        tech_desktop = psi_fetch(client_url, "desktop", psi_api_key)
-        
-        # Combine mobile and desktop data
-        data["sites"]["client"]["tech"] = {
-            **tech_mobile,
-            "mobile_cwv_pass": "true" if all(
-                tech_mobile[k] == "pass" for k in ("lcp_status", "inp_status", "cls_status")
-            ) else "false",
-            "desktop_cwv_pass": "true" if all(
-                tech_desktop[k] == "pass" for k in ("lcp_status", "inp_status", "cls_status")
-            ) else "false",
-        }
-        
-        # Calculate health score
-        health_score = calculate_health_score(tech_mobile)
-        data["kpi"]["health_score"] = str(health_score)
+        try:
+            tech_mobile, tech_desktop = psi_fetch_parallel(client_url, psi_api_key)
+            
+            # Combine mobile and desktop data
+            data["sites"]["client"]["tech"] = {
+                **tech_mobile,
+                               "mobile_cwv_pass": "true" if all(
+                    tech_mobile[k] == "pass" for k in ("lcp_status", "inp_status", "cls_status")
+                ) else "false",
+                "desktop_cwv_pass": "true" if all(
+                    tech_desktop[k] == "pass" for k in ("lcp_status", "inp_status", "cls_status")
+                ) else "false",
+            }
+            
+            # Calculate health score
+            health_score = calculate_health_score(tech_mobile)
+            data["kpi"]["health_score"] = str(health_score)
+        except Exception as e:
+            print(f"[PSI] Error processing PSI data: {e}")
+            # Set default tech data on failure
+            data["sites"]["client"]["tech"] = {
+                "lcp_ms": 0, "lcp_status": "fail",
+                "inp_ms": 0, "inp_status": "fail",
+                "cls": 0.0, "cls_status": "fail",
+                "mobile_cwv_pass": "false",
+                "desktop_cwv_pass": "false"
+            }
     
-    # 2. Fetch keywords data
+    # 2. Fetch keywords data in parallel
     serpstack_api_key = os.getenv("SERPSTACK_API_KEY")
     client_keywords = []
     comp1_keywords = []
     comp2_keywords = []
     
     if serpstack_api_key:
-        # Client keywords
-        client_keywords = serpstack_fetch_keywords(client_url, serpstack_api_key)
-        data["keywords"]["top"] = client_keywords
-        data["kpi"]["keyword_count"] = str(len(client_keywords))
-        
-        # Competitor keywords
-        if comp1_url:
-            comp1_keywords = serpstack_fetch_keywords(comp1_url, serpstack_api_key)
-        
-        if comp2_url:
-            comp2_keywords = serpstack_fetch_keywords(comp2_url, serpstack_api_key)
-        
-        # Find keyword gaps
-        data["keywords"]["gaps"] = get_keyword_gaps(client_keywords, comp1_keywords, comp2_keywords)
+        try:
+            client_keywords, comp1_keywords, comp2_keywords = fetch_keywords_parallel(
+                client_url, comp1_url, comp2_url, serpstack_api_key
+            )
+            
+            data["keywords"]["top"] = client_keywords
+            data["kpi"]["keyword_count"] = str(len(client_keywords))
+            
+            # Find keyword gaps
+            data["keywords"]["gaps"] = get_keyword_gaps(client_keywords, comp1_keywords, comp2_keywords)
+        except Exception as e:
+            print(f"[SERPSTACK] Error processing keyword data: {e}")
+            # Keep empty lists as defaults
     
     # 3. Google Trends data for content plan
-    data["strategy"]["content_plan"] = get_trends_data(client_keywords)
+    try:
+        data["strategy"]["content_plan"] = get_trends_data(client_keywords)
+    except Exception as e:
+        print(f"[TRENDS] Error generating content plan: {e}")
+        data["strategy"]["content_plan"] = []
     
     # 4. On-page issues
-    data["on_page"]["issues"] = fetch_on_page_issues(client_url)
-    data["on_page"]["rewrites"] = generate_rewrites(client_url, client_keywords)
+    try:
+        data["on_page"]["issues"] = fetch_on_page_issues(client_url)
+        data["on_page"]["rewrites"] = generate_rewrites(client_url, client_keywords)
+    except Exception as e:
+        print(f"[ONPAGE] Error processing on-page data: {e}")
+        data["on_page"]["issues"] = [{
+            "url": "/",
+            "issue": "Error analyzing page",
+            "fix": "Check site accessibility"
+        }]
+        data["on_page"]["rewrites"] = []
     
     # 5. Generate quick wins based on Core Web Vitals
-    data["strategy"]["quick_wins"] = generate_quick_wins(data["sites"]["client"]["tech"])
+    try:
+        data["strategy"]["quick_wins"] = generate_quick_wins(data["sites"]["client"]["tech"])
+    except Exception as e:
+        print(f"[STRATEGY] Error generating quick wins: {e}")
+        data["strategy"]["quick_wins"] = []
     
     # 6. Generate backlink strategy
-    data["strategy"]["backlinks"] = generate_backlink_strategy(data["keywords"]["gaps"])
+    try:
+        data["strategy"]["backlinks"] = generate_backlink_strategy(data["keywords"]["gaps"])
+    except Exception as e:
+        print(f"[STRATEGY] Error generating backlink strategy: {e}")
+        data["strategy"]["backlinks"] = {
+            "strategy": "Unable to generate backlink strategy",
+            "prospects": []
+        }
     
     # 7. Generate roadmap
-    data["strategy"]["roadmap"] = generate_roadmap(
-        data["sites"]["client"]["tech"], 
-        data["keywords"]["gaps"]
-    )
+    try:
+        data["strategy"]["roadmap"] = generate_roadmap(
+            data["sites"]["client"]["tech"], 
+            data["keywords"]["gaps"]
+        )
+    except Exception as e:
+        print(f"[STRATEGY] Error generating roadmap: {e}")
+        data["strategy"]["roadmap"] = {
+            "month_1": ["Analyze site performance"],
+            "month_3": ["Implement content strategy"],
+            "month_6": ["Review and optimize"]
+        }
     
     # 8. Benchmark data
-    data["bench"]["client"] = estimate_domain_metrics(client_keywords)
-    
-    if comp1_url:
-        data["bench"]["comp1"] = estimate_domain_metrics(comp1_keywords)
-    
-    if comp2_url:
-        data["bench"]["comp2"] = estimate_domain_metrics(comp2_keywords)
+    try:
+        data["bench"]["client"] = estimate_domain_metrics(client_keywords)
+        
+        if comp1_url:
+            data["bench"]["comp1"] = estimate_domain_metrics(comp1_keywords)
+        
+        if comp2_url:
+            data["bench"]["comp2"] = estimate_domain_metrics(comp2_keywords)
+    except Exception as e:
+        print(f"[BENCH] Error calculating benchmark data: {e}")
+        # Keep default benchmark data
     
     # 9. AI-generated summaries
-    ai_summaries = generate_ai_summary(
-        data,
-        {"keywords": {"top": comp1_keywords}},
-        {"keywords": {"top": comp2_keywords}}
-    )
-    
-    data["strategy"]["executive_summary"] = ai_summaries["executive_summary"]
-    data["strategy"]["competitor_commentary"] = ai_summaries["competitor_commentary"]
+    try:
+        ai_summaries = generate_ai_summary(
+            data,
+            {"keywords": {"top": comp1_keywords}},
+            {"keywords": {"top": comp2_keywords}}
+        )
+        
+        data["strategy"]["executive_summary"] = ai_summaries["executive_summary"]
+        data["strategy"]["competitor_commentary"] = ai_summaries["competitor_commentary"]
+    except Exception as e:
+        print(f"[AI] Error generating AI summaries: {e}")
+        data["strategy"]["executive_summary"] = "Unable to generate summary. Using data-driven insights to improve your strategy."
+        data["strategy"]["competitor_commentary"] = "Competitor analysis unavailable. Focus on your core strengths and unique value proposition."
     
     return data
 
@@ -714,13 +873,19 @@ def fetch_all_data(client_url: str, comp1_url: Optional[str] = None, comp2_url: 
 # Template Rendering
 # ---------------------------
 def render_template_with_data(data: dict) -> str:
+    """Safely render template with fallbacks for missing data."""
     if not TEMPLATE_PATH.exists():
         return "Template not found. Create templates/nykra_report.html"
-    html_template = TEMPLATE_PATH.read_text(encoding="utf-8")
-    # normalize {{#each ...}} … {{/each}} to Mustache sections
-    html_template = normalize_handlebars_each_to_mustache(html_template)
-    renderer = pystache.Renderer(escape=lambda u: u)  # don't escape; template is trusted
-    return renderer.render(html_template, data)
+    
+    try:
+        html_template = TEMPLATE_PATH.read_text(encoding="utf-8")
+        # normalize {{#each ...}} … {{/each}} to Mustache sections
+        html_template = normalize_handlebars_each_to_mustache(html_template)
+        renderer = pystache.Renderer(escape=lambda u: u)  # don't escape; template is trusted
+        return renderer.render(html_template, data)
+    except Exception as e:
+        print(f"[TEMPLATE] Error rendering template: {e}")
+        return f"Error rendering template: {str(e)}"
 
 def validate_payload(data: dict):
     """Minimal sanity check; expand later as needed"""
@@ -734,12 +899,31 @@ def validate_payload(data: dict):
 def home():
     return "SEO service is running!"
 
+@app.route("/diag/psi")
+def diag_psi():
+    """Quick diagnostic endpoint to check PSI API health."""
+    api_key = os.getenv("GOOGLE_PAGESPEED_API_KEY")
+    if not api_key:
+        return jsonify({"ok": False, "error": "Missing GOOGLE_PAGESPEED_API_KEY"})
+
+    try:
+        # Use a very short timeout for quick health check
+        resp = PSI_SESSION.get(
+            "https://www.googleapis.com/pagespeedonline/v5/runPagespeed",
+            params={"url": "https://example.com", "strategy": "mobile", "category": "PERFORMANCE", "key": api_key},
+            timeout=(3, 5)
+        )
+        resp.raise_for_status()
+        return jsonify({"ok": True, "status_code": resp.status_code})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
 @app.route("/report/psi")
 def report_psi():
     """Renders the report with live Core Web Vitals for ?url=... using PSI."""
     api_key = os.getenv("GOOGLE_PAGESPEED_API_KEY")
     if not api_key:
-        return "Missing GOOGLE_PAGESPEED_API_KEY", 500
+        return "Missing GOOGLE_PAGESPEED_API_KEY. Set this environment variable to use this endpoint.", 400
 
     raw_url = request.args.get("url", "").strip()
     if not raw_url:
@@ -747,26 +931,42 @@ def report_psi():
     if not urlparse(raw_url).scheme:
         raw_url = "https://" + raw_url  # ensure scheme
 
-    # Fetch PSI for both strategies
-    tech_mobile = psi_fetch(raw_url, "mobile", api_key)
-    tech_desktop = psi_fetch(raw_url, "desktop", api_key)
+    # Fetch PSI for both strategies in parallel
+    try:
+        tech_mobile, tech_desktop = psi_fetch_parallel(raw_url, api_key)
 
-    data = create_base_payload(raw_url)
-    data["client_name"] = raw_url
-    data["sites"]["client"]["tech"] = {
-        **tech_mobile,
-        "mobile_cwv_pass": "true" if all(
-            tech_mobile[k] == "pass" for k in ("lcp_status", "inp_status", "cls_status")
-        ) else "false",
-        "desktop_cwv_pass": "true" if all(
-                        tech_desktop[k] == "pass" for k in ("lcp_status", "inp_status", "cls_status")
-        ) else "false",
-    }
+        data = create_base_payload(raw_url)
+        data["client_name"] = raw_url
+        data["sites"]["client"]["tech"] = {
+            **tech_mobile,
+            "mobile_cwv_pass": "true" if all(
+                tech_mobile[k] == "pass" for k in ("lcp_status", "inp_status", "cls_status")
+            ) else "false",
+            "desktop_cwv_pass": "true" if all(
+                tech_desktop[k] == "pass" for k in ("lcp_status", "inp_status", "cls_status")
+            ) else "false",
+        }
 
-    filled_html = render_template_with_data(data)
-    if filled_html.startswith("Template not found"):
-        return filled_html, 500
-    return Response(filled_html, mimetype="text/html")
+        filled_html = render_template_with_data(data)
+        if filled_html.startswith("Template not found"):
+            return filled_html, 404
+        return Response(filled_html, mimetype="text/html")
+    except Exception as e:
+        print(f"[REPORT] Error in /report/psi: {e}")
+        # Create minimal data with error indicators
+        data = create_base_payload(raw_url)
+        data["client_name"] = raw_url
+        data["sites"]["client"]["tech"] = {
+            "lcp_ms": 0, "lcp_status": "fail",
+            "inp_ms": 0, "inp_status": "fail",
+            "cls": 0.0, "cls_status": "fail",
+            "mobile_cwv_pass": "false",
+            "desktop_cwv_pass": "false"
+        }
+        data["strategy"]["executive_summary"] = f"Error fetching PSI data: {str(e)[:100]}"
+        
+        filled_html = render_template_with_data(data)
+        return Response(filled_html, mimetype="text/html")
 
 @app.route("/report/full")
 def report_full():
@@ -789,7 +989,11 @@ def report_full():
         missing_keys.append("OPENAI_API_KEY")
     
     if missing_keys:
-        return f"Missing required API keys: {', '.join(missing_keys)}", 500
+        # Create a basic report noting the missing keys
+        data = create_base_payload(client_url)
+        data["strategy"]["executive_summary"] = f"Missing required API keys: {', '.join(missing_keys)}"
+        filled_html = render_template_with_data(data)
+        return Response(filled_html, mimetype="text/html")
     
     # Fetch all data and render the report
     try:
@@ -797,11 +1001,17 @@ def report_full():
         filled_html = render_template_with_data(data)
         
         if filled_html.startswith("Template not found"):
-            return filled_html, 500
+            return filled_html, 404
             
         return Response(filled_html, mimetype="text/html")
     except Exception as e:
-        return f"Error generating report: {str(e)}", 500
+        print(f"[REPORT] Error in /report/full: {e}")
+        # Create minimal data with error indicators
+        data = create_base_payload(client_url)
+        data["strategy"]["executive_summary"] = f"Error generating full report: {str(e)[:100]}"
+        
+        filled_html = render_template_with_data(data)
+        return Response(filled_html, mimetype="text/html")
 
 @app.route("/report/render", methods=["POST"])
 def report_render():
@@ -809,65 +1019,101 @@ def report_render():
     if not request.is_json:
         return "Send JSON body", 400
     
-    data = request.get_json(silent=True) or {}
-    missing = validate_payload(data)
-    if missing:
-        return jsonify({"error": "missing fields", "fields": missing}), 400
+    try:
+        data = request.get_json(silent=True) or {}
+        missing = validate_payload(data)
+        if missing:
+            return jsonify({"error": "missing fields", "fields": missing}), 400
 
-    filled_html = render_template_with_data(data)
-    if filled_html.startswith("Template not found"):
-        return filled_html, 500
-    
-    return Response(filled_html, mimetype="text/html")
+        filled_html = render_template_with_data(data)
+        if filled_html.startswith("Template not found"):
+            return filled_html, 404
+        
+        return Response(filled_html, mimetype="text/html")
+    except Exception as e:
+        print(f"[REPORT] Error in /report/render: {e}")
+        return jsonify({"error": f"Error rendering report: {str(e)}"}), 500
 
 @app.route("/api/keywords", methods=["GET"])
 def api_keywords():
     """API endpoint to fetch keywords for a domain."""
     domain = request.args.get("domain", "").strip()
     if not domain:
-        return jsonify({"error": "Missing domain parameter"}), 400
+        return jsonify({"ok": False, "error": "Missing domain parameter"}), 400
         
     api_key = os.getenv("SERPSTACK_API_KEY")
     if not api_key:
-        return jsonify({"error": "Missing SERPSTACK_API_KEY"}), 500
-        
-    keywords = serpstack_fetch_keywords(domain, api_key)
-    return jsonify({"domain": domain, "keywords": keywords})
+        return jsonify({"ok": False, "error": "Missing SERPSTACK_API_KEY"}), 400
+    
+    try:
+        keywords = serpstack_fetch_keywords(domain, api_key)
+        return jsonify({"ok": True, "domain": domain, "keywords": keywords})
+    except Exception as e:
+        print(f"[API] Error in /api/keywords: {e}")
+        return jsonify({"ok": False, "error": str(e), "domain": domain, "keywords": []}), 200  # Return 200 with error info
 
 @app.route("/api/cwv", methods=["GET"])
 def api_cwv():
     """API endpoint to fetch Core Web Vitals for a URL."""
     url = request.args.get("url", "").strip()
     if not url:
-        return jsonify({"error": "Missing url parameter"}), 400
+        return jsonify({"ok": False, "error": "Missing url parameter"}), 400
         
     api_key = os.getenv("GOOGLE_PAGESPEED_API_KEY")
     if not api_key:
-        return jsonify({"error": "Missing GOOGLE_PAGESPEED_API_KEY"}), 500
-        
-    mobile = psi_fetch(url, "mobile", api_key)
-    desktop = psi_fetch(url, "desktop", api_key)
+        return jsonify({"ok": False, "error": "Missing GOOGLE_PAGESPEED_API_KEY"}), 400
     
-    return jsonify({
-        "url": url,
-        "mobile": mobile,
-        "desktop": desktop
-    })
+    try:
+        mobile, desktop = psi_fetch_parallel(url, api_key)
+        
+        return jsonify({
+            "ok": True,
+            "url": url,
+            "mobile": mobile,
+            "desktop": desktop
+        })
+    except Exception as e:
+        print(f"[API] Error in /api/cwv: {e}")
+        return jsonify({
+            "ok": False,
+            "error": str(e),
+            "url": url,
+            "mobile": {
+                "lcp_ms": 0, "lcp_status": "fail",
+                "inp_ms": 0, "inp_status": "fail",
+                "cls": 0.0, "cls_status": "fail"
+            },
+            "desktop": {
+                "lcp_ms": 0, "lcp_status": "fail",
+                "inp_ms": 0, "inp_status": "fail",
+                "cls": 0.0, "cls_status": "fail"
+            }
+        }), 200  # Return 200 with error info
 
 @app.route("/api/trends", methods=["GET"])
 def api_trends():
     """API endpoint to fetch Google Trends data for keywords."""
     keywords = request.args.get("keywords", "").strip().split(",")
     if not keywords or keywords[0] == "":
-        return jsonify({"error": "Missing keywords parameter"}), 400
-        
-    keyword_data = [{"kw": kw} for kw in keywords]
-    trends = get_trends_data(keyword_data)
+        return jsonify({"ok": False, "error": "Missing keywords parameter"}), 400
     
-    return jsonify({
-        "keywords": keywords,
-        "trends": trends
-    })
+    try:
+        keyword_data = [{"kw": kw} for kw in keywords]
+        trends = get_trends_data(keyword_data)
+        
+        return jsonify({
+            "ok": True,
+            "keywords": keywords,
+            "trends": trends
+        })
+    except Exception as e:
+        print(f"[API] Error in /api/trends: {e}")
+        return jsonify({
+            "ok": False,
+            "error": str(e),
+            "keywords": keywords,
+            "trends": []
+        }), 200  # Return 200 with error info
 
 # Local debug (Render uses gunicorn via Procfile)
 if __name__ == "__main__":

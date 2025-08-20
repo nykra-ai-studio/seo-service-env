@@ -4,7 +4,7 @@ import pathlib
 import re
 import time
 import concurrent.futures
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional, Tuple
 from urllib.parse import urlparse, quote_plus
 
@@ -16,6 +16,8 @@ from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
 import openai
 from pytrends.request import TrendReq
+from bs4 import BeautifulSoup
+import anthropic
 
 # Note: Procfile should use gunicorn with --timeout 90 to allow for API calls with retries
 
@@ -24,18 +26,35 @@ CORS(app)  # Enable CORS for n8n
 
 TEMPLATE_PATH = pathlib.Path("templates/nykra_report.html").resolve()
 
+# In-memory cache with TTL
+CACHE = {}
+CACHE_TTL = 600  # 10 minutes in seconds
+
+def get_from_cache(key):
+    """Get item from cache if it exists and is not expired"""
+    if key in CACHE:
+        item, expiry = CACHE[key]
+        if time.time() < expiry:
+            return item
+    return None
+
+def set_in_cache(key, value):
+    """Set item in cache with TTL"""
+    CACHE[key] = (value, time.time() + CACHE_TTL)
+
 # ---------- HTTP Sessions with Retries ----------
 def create_session(prefix: str, connect_timeout: int, read_timeout: int) -> requests.Session:
     """Create a requests session with retries and timeouts"""
     session = requests.Session()
     retry_strategy = Retry(
         total=2,
-        backoff_factor=0.6,
+        backoff_factor=0.5,
         status_forcelist=[429, 500, 502, 503, 504],
     )
     adapter = HTTPAdapter(max_retries=retry_strategy)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
+    session.headers.update({"User-Agent": "nykra-mvp/1.0 (+https://nykra.studio)"})
     # Log session creation for debugging
     print(f"[{prefix}] Created session with ({connect_timeout}, {read_timeout}) timeouts")
     return session
@@ -43,6 +62,9 @@ def create_session(prefix: str, connect_timeout: int, read_timeout: int) -> requ
 # Create service-specific sessions
 PSI_SESSION = create_session("PSI", 5, 12)
 SERPSTACK_SESSION = create_session("SERPSTACK", 5, 10)
+BING_SESSION = create_session("BING", 5, 10)
+AZURE_SESSION = create_session("AZURE", 5, 10)
+GENERAL_SESSION = create_session("GENERAL", 5, 10)
 
 # ---------- Handlebars → Mustache normalizer ----------
 def normalize_handlebars_each_to_mustache(html: str) -> str:
@@ -72,6 +94,11 @@ def normalize_handlebars_each_to_mustache(html: str) -> str:
 # ---------------------------
 def psi_fetch(url: str, strategy: str, api_key: str) -> dict:
     """Fetch Core Web Vitals from Google PageSpeed Insights (robust INP extraction)."""
+    cache_key = f"psi_{url}_{strategy}"
+    cached = get_from_cache(cache_key)
+    if cached:
+        return cached
+        
     default_response = {
         "lcp_ms": 0, "lcp_status": "fail",
         "inp_ms": 0, "inp_status": "fail",
@@ -112,7 +139,7 @@ def psi_fetch(url: str, strategy: str, api_key: str) -> dict:
             if v is None: return "fail"
             return "pass" if v <= 0.1 else "needs improvement" if v <= 0.25 else "fail"
 
-        return {
+        result = {
             "lcp_ms": int(round(lcp)) if isinstance(lcp, (int, float)) else 0,
             "lcp_status": status_lcp(lcp),
             "inp_ms": int(round(inp)) if isinstance(inp, (int, float)) else 0,
@@ -120,12 +147,20 @@ def psi_fetch(url: str, strategy: str, api_key: str) -> dict:
             "cls": round(cls, 3) if isinstance(cls, (int, float)) else 0.0,
             "cls_status": status_cls(cls),
         }
+        
+        set_in_cache(cache_key, result)
+        return result
     except Exception as e:
         print(f"[PSI] API error ({strategy}): {e}")
         return default_response
 
 def psi_fetch_parallel(url: str, api_key: str) -> Tuple[dict, dict]:
     """Fetch PSI data for mobile and desktop in parallel using ThreadPoolExecutor."""
+    cache_key = f"psi_parallel_{url}"
+    cached = get_from_cache(cache_key)
+    if cached:
+        return cached
+        
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         mobile_future = executor.submit(psi_fetch, url, "mobile", api_key)
         desktop_future = executor.submit(psi_fetch, url, "desktop", api_key)
@@ -151,10 +186,17 @@ def psi_fetch_parallel(url: str, api_key: str) -> Tuple[dict, dict]:
                 "cls": 0.0, "cls_status": "fail"
             }
     
-    return mobile_result, desktop_result
+    result = (mobile_result, desktop_result)
+    set_in_cache(cache_key, result)
+    return result
 
 def serpstack_fetch_keywords(domain: str, api_key: str, limit: int = 10) -> List[Dict]:
     """Fetch top ranking keywords for a domain using Serpstack API."""
+    cache_key = f"serpstack_{domain}"
+    cached = get_from_cache(cache_key)
+    if cached:
+        return cached
+        
     try:
         # Extract domain without protocol
         parsed_domain = urlparse(domain)
@@ -190,12 +232,14 @@ def serpstack_fetch_keywords(domain: str, api_key: str, limit: int = 10) -> List
             # Extract path from URL for internal reference
             path = urlparse(url).path or "/"
             
+            # Sanitize title to extract likely keyword
+            # Remove brand suffixes like "- Brand Name"
+            keyword = re.sub(r'\s+[-—|]\s+.*$', '', title).strip()
+            
             # Estimate volume based on position (this is a rough approximation)
             # In a real implementation, you'd use a keyword volume API
             volume = max(3000 - (position * 200), 100)
             
-            # Extract main keyword from title
-            keyword = title.split(" - ")[0].strip()
             if len(keyword) > 5:  # Only include meaningful keywords
                 keywords.append({
                     "kw": keyword[:50],  # Limit length
@@ -204,7 +248,9 @@ def serpstack_fetch_keywords(domain: str, api_key: str, limit: int = 10) -> List
                     "url": path
                 })
         
-        return keywords[:limit]
+        result = keywords[:limit]
+        set_in_cache(cache_key, result)
+        return result
     except Exception as e:
         print(f"[SERPSTACK] API error for domain {domain}: {e}")
         return []
@@ -212,6 +258,11 @@ def serpstack_fetch_keywords(domain: str, api_key: str, limit: int = 10) -> List
 def fetch_keywords_parallel(client_url: str, comp1_url: Optional[str], comp2_url: Optional[str], 
                            api_key: str) -> Tuple[List[Dict], List[Dict], List[Dict]]:
     """Fetch keywords for client and competitors in parallel."""
+    cache_key = f"keywords_parallel_{client_url}_{comp1_url}_{comp2_url}"
+    cached = get_from_cache(cache_key)
+    if cached:
+        return cached
+        
     client_keywords = []
     comp1_keywords = []
     comp2_keywords = []
@@ -251,7 +302,9 @@ def fetch_keywords_parallel(client_url: str, comp1_url: Optional[str], comp2_url
                 print(f"[SERPSTACK] Competitor 2 keywords fetch timed out or failed: {e}")
                 comp2_keywords = []
     
-    return client_keywords, comp1_keywords, comp2_keywords
+    result = (client_keywords, comp1_keywords, comp2_keywords)
+    set_in_cache(cache_key, result)
+    return result
 
 def get_keyword_gaps(client_keywords: List[Dict], comp1_keywords: List[Dict], 
                     comp2_keywords: List[Dict]) -> List[Dict]:
@@ -298,6 +351,11 @@ def get_keyword_gaps(client_keywords: List[Dict], comp1_keywords: List[Dict],
 
 def get_trends_data(keywords: List[Dict], timeframe='today 12-m') -> List[Dict]:
     """Get Google Trends data for top keywords to suggest content topics."""
+    cache_key = f"trends_{'_'.join([k['kw'] for k in keywords[:3]])}"
+    cached = get_from_cache(cache_key)
+    if cached:
+        return cached
+        
     if not keywords:
         return []
         
@@ -334,29 +392,269 @@ def get_trends_data(keywords: List[Dict], timeframe='today 12-m') -> List[Dict]:
             except Exception as e:
                 print(f"[TRENDS] Error getting trends for {kw}: {e}")
                 continue
-                
+        
+        set_in_cache(cache_key, content_ideas)
         return content_ideas
     except Exception as e:
         print(f"[TRENDS] Google Trends error: {e}")
         return []
 
-def generate_ai_summary(client_data: Dict, comp1_data: Dict, comp2_data: Dict) -> Dict:
-    """Generate AI summaries based on actual data."""
-    api_key = os.getenv("OPENAI_API_KEY")
-    default_response = {
-        "executive_summary": "Unable to generate summary. Using data-driven insights to improve your strategy.",
-        "competitor_commentary": "Competitor analysis unavailable. Focus on your core strengths and unique value proposition."
-    }
-    
+def bing_search_prospects(domain: str, keywords: List[Dict], api_key: str) -> List[Dict]:
+    """Search for backlink prospects using Bing Search API."""
+    cache_key = f"bing_prospects_{domain}"
+    cached = get_from_cache(cache_key)
+    if cached:
+        return cached
+        
     if not api_key:
-        print("[AI] Missing OPENAI_API_KEY")
-        return default_response
+        return []
+        
+    prospects = []
+    parsed_domain = urlparse(domain)
+    clean_domain = parsed_domain.netloc or parsed_domain.path.split('/')[0]
+    domain_without_tld = clean_domain.split('.')[0]
+    
+    # Extract a potential industry keyword from the top keyword
+    industry_kw = ""
+    if keywords and len(keywords) > 0:
+        top_kw = keywords[0]["kw"]
+        # Take first two words as industry keyword
+        industry_kw = " ".join(top_kw.split()[:2])
+    
+    queries = [
+        f"brand reviews {domain_without_tld}",
+        f"\"{domain_without_tld}\" -site:{clean_domain}"
+    ]
+    
+    if industry_kw:
+        queries.append(f"link roundup \"{industry_kw}\"")
+    
+    try:
+        found_domains = set()
+        
+        for query in queries:
+            try:
+                headers = {
+                    "Ocp-Apim-Subscription-Key": api_key
+                }
+                
+                resp = BING_SESSION.get(
+                    "https://api.bing.microsoft.com/v7.0/search",
+                    headers=headers,
+                    params={
+                        "q": query,
+                        "count": 10,
+                        "responseFilter": "Webpages"
+                    },
+                    timeout=(5, 10)
+                )
+                resp.raise_for_status()
+                
+                data = resp.json()
+                
+                # Extract domains from results
+                for result in data.get("webPages", {}).get("value", []):
+                    url = result.get("url", "")
+                    parsed = urlparse(url)
+                    result_domain = parsed.netloc
+                    
+                    # Skip client domain and already found domains
+                    if result_domain and result_domain != clean_domain and result_domain not in found_domains:
+                        found_domains.add(result_domain)
+                        
+                        # Determine why this is a prospect
+                        why = "Relevant industry mention"
+                        if "review" in query:
+                            why = "Brand review site"
+                        elif "roundup" in query:
+                            why = "Industry link roundup"
+                        
+                        prospects.append({
+                            "type": "prospect",
+                            "why": why,
+                            "domain": result_domain
+                        })
+            except Exception as e:
+                print(f"[BING] Error searching for '{query}': {e}")
+                continue
+        
+        set_in_cache(cache_key, prospects[:10])  # Limit to top 10 prospects
+        return prospects[:10]
+    except Exception as e:
+        print(f"[BING] Error fetching backlink prospects: {e}")
+        return []
+
+def fetch_homepage_issues(url: str) -> Tuple[List[Dict], List[Dict]]:
+    """Fetch and analyze homepage for basic SEO issues."""
+    cache_key = f"homepage_issues_{url}"
+    cached = get_from_cache(cache_key)
+    if cached:
+        return cached
+        
+    issues = []
+    largest_image = None
+    
+    try:
+        resp = GENERAL_SESSION.get(url, timeout=(5, 8))
+        resp.raise_for_status()
+        html = resp.text
+        
+        soup = BeautifulSoup(html, 'lxml')
+        
+        # Check for H1
+        h1_tags = soup.find_all('h1')
+        if not h1_tags:
+            issues.append({
+                "url": "/",
+                "issue": "Missing H1 tag",
+                "fix": "Add a unique H1 tag with target keyword"
+            })
+        
+        # Check for title
+        title_tag = soup.find('title')
+        if not title_tag or not title_tag.text.strip():
+            issues.append({
+                "url": "/",
+                "issue": "Missing title tag",
+                "fix": "Add a descriptive title with primary keyword"
+            })
+        
+        # Check for meta description
+        meta_desc = soup.find('meta', attrs={"name": "description"})
+        if not meta_desc:
+            issues.append({
+                "url": "/",
+                "issue": "Missing meta description",
+                "fix": "Add a compelling meta description with primary keyword"
+            })
+        
+        # Find largest image in above-the-fold region (heuristic)
+        images = soup.find_all('img')
+        max_size = 0
+        for img in images[:10]:  # Look at first 10 images only
+            src = img.get('src', '')
+            if not src:
+                continue
+                
+            # Check if image has width/height attributes
+            width = img.get('width', '')
+            height = img.get('height', '')
+            
+            if width and height:
+                try:
+                    size = int(width) * int(height)
+                    if size > max_size:
+                        max_size = size
+                        largest_image = {
+                            "src": src,
+                            "alt": img.get('alt', ''),
+                            "width": width,
+                            "height": height
+                        }
+                except (ValueError, TypeError):
+                    pass
+        
+        # If no image with dimensions found, try first image
+        if not largest_image and images:
+            largest_image = {
+                "src": images[0].get('src', ''),
+                "alt": images[0].get('alt', ''),
+                "width": images[0].get('width', ''),
+                "height": images[0].get('height', '')
+            }
+        
+        # Make image URL absolute if it's relative
+        if largest_image and largest_image["src"] and not largest_image["src"].startswith(('http://', 'https://')):
+            base_url = urlparse(url)
+            base = f"{base_url.scheme}://{base_url.netloc}"
+            largest_image["src"] = base + largest_image["src"] if largest_image["src"].startswith('/') else base + '/' + largest_image["src"]
+        
+        result = (issues, largest_image)
+        set_in_cache(cache_key, result)
+        return result
+    except Exception as e:
+        print(f"[ONPAGE] Error fetching on-page issues: {e}")
+        return ([{
+            "url": "/",
+            "issue": f"Error analyzing page: {str(e)[:100]}",
+            "fix": "Check site accessibility"
+        }], None)
+
+def azure_vision_analyze(image_url: str, endpoint: str, api_key: str) -> Dict:
+    """Analyze image using Azure Computer Vision API."""
+    if not endpoint or not api_key or not image_url:
+        return {"tags": [], "caption": ""}
+    
+    cache_key = f"azure_vision_{image_url}"
+    cached = get_from_cache(cache_key)
+    if cached:
+        return cached
+        
+    try:
+        # Try Vision API 4.0 first
+        headers = {
+            "Ocp-Apim-Subscription-Key": api_key,
+            "Content-Type": "application/json"
+        }
+        
+        body = {
+            "url": image_url
+        }
+        
+        resp = AZURE_SESSION.post(
+            f"{endpoint}/computervision/imageanalysis:analyze?api-version=2023-02-01-preview&features=tags,caption",
+            headers=headers,
+            json=body,
+            timeout=(5, 10)
+        )
+        
+        # If 4.0 fails, try 3.2
+        if resp.status_code != 200:
+            resp = AZURE_SESSION.post(
+                f"{endpoint}/vision/v3.2/analyze?visualFeatures=Tags,Description",
+                headers=headers,
+                json=body,
+                timeout=(5, 10)
+            )
+        
+        resp.raise_for_status()
+        data = resp.json()
+        
+        # Extract tags and caption based on API version
+        tags = []
+        caption = ""
+        
+        if "tagsResult" in data:  # API 4.0
+            tags = [tag["name"] for tag in data.get("tagsResult", {}).get("values", [])]
+            caption = data.get("captionResult", {}).get("text", "")
+        else:  # API 3.2
+            tags = [tag["name"] for tag in data.get("tags", [])]
+            captions = data.get("description", {}).get("captions", [])
+            if captions:
+                caption = captions[0].get("text", "")
+        
+        result = {
+            "tags": tags[:10],  # Limit to top 10 tags
+            "caption": caption
+        }
+        
+        set_in_cache(cache_key, result)
+        return result
+    except Exception as e:
+        print(f"[AZURE] Error analyzing image: {e}")
+        return {"tags": [], "caption": ""}
+
+def ai_summary_openai(data: Dict) -> Dict:
+    """Generate AI summary using OpenAI."""
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return {"executive_summary": "", "competitor_commentary": ""}
     
     try:
         # Prepare data for the AI
-        client_tech = client_data.get("sites", {}).get("client", {}).get("tech", {})
-        client_keywords = client_data.get("keywords", {}).get("top", [])
-        keyword_gaps = client_data.get("keywords", {}).get("gaps", [])
+        client_tech = data.get("sites", {}).get("client", {}).get("tech", {})
+        client_keywords = data.get("keywords", {}).get("top", [])
+        keyword_gaps = data.get("keywords", {}).get("gaps", [])
         
         # Format data for the prompt
         tech_summary = (
@@ -369,12 +667,12 @@ def generate_ai_summary(client_data: Dict, comp1_data: Dict, comp2_data: Dict) -
         
         keyword_summary = "Top keywords: " + ", ".join([
             f"{kw['kw']} (pos {kw['pos']}, vol {kw['vol']})" 
-            for kw in client_keywords[:5]
+            for kw in client_keywords[:3]
         ]) if client_keywords else "No keyword data available."
         
         gaps_summary = "Keyword gaps: " + ", ".join([
             f"{gap['kw']} (comp1: {gap['comp1_rank']}, comp2: {gap['comp2_rank']})" 
-            for gap in keyword_gaps[:5]
+            for gap in keyword_gaps[:3]
         ]) if keyword_gaps else "No keyword gap data available."
         
         # Create the executive summary prompt
@@ -403,7 +701,10 @@ def generate_ai_summary(client_data: Dict, comp1_data: Dict, comp2_data: Dict) -
         client = openai.OpenAI(api_key=api_key)
         exec_response = client.chat.completions.create(
             model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": exec_prompt}],
+            messages=[
+                {"role": "system", "content": "You are summarizing internal JSON facts for a client SEO report. Use only what you are given. If a datum is missing, do not infer or guess. Respond with 1–2 sentences."},
+                {"role": "user", "content": exec_prompt}
+            ],
             max_tokens=150,
             temperature=0.7,
             timeout=10  # 10 second timeout
@@ -412,7 +713,10 @@ def generate_ai_summary(client_data: Dict, comp1_data: Dict, comp2_data: Dict) -
         # Generate competitor commentary
         comp_response = client.chat.completions.create(
             model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": comp_prompt}],
+            messages=[
+                {"role": "system", "content": "You are summarizing internal JSON facts for a client SEO report. Use only what you are given. If a datum is missing, do not infer or guess. Respond with 1–2 sentences."},
+                {"role": "user", "content": comp_prompt}
+            ],
             max_tokens=100,
             temperature=0.7,
             timeout=10  # 10 second timeout
@@ -423,8 +727,112 @@ def generate_ai_summary(client_data: Dict, comp1_data: Dict, comp2_data: Dict) -
             "competitor_commentary": comp_response.choices[0].message.content.strip()
         }
     except Exception as e:
-        print(f"[AI] Summary generation error: {e}")
-        return default_response
+        print(f"[OPENAI] Summary generation error: {e}")
+        return {"executive_summary": "", "competitor_commentary": ""}
+
+def ai_summary_claude(data: Dict) -> Dict:
+    """Generate AI summary using Claude as fallback."""
+    api_key = os.getenv("CLAUDE_API_KEY")
+    if not api_key:
+        return {"executive_summary": "", "competitor_commentary": ""}
+    
+    try:
+        # Prepare data for the AI
+        client_tech = data.get("sites", {}).get("client", {}).get("tech", {})
+        client_keywords = data.get("keywords", {}).get("top", [])
+        keyword_gaps = data.get("keywords", {}).get("gaps", [])
+        
+        # Format data for the prompt
+        tech_summary = (
+            f"Core Web Vitals: LCP {client_tech.get('lcp_ms', 0)}ms ({client_tech.get('lcp_status', 'unknown')}), "
+            f"CLS {client_tech.get('cls', 0)} ({client_tech.get('cls_status', 'unknown')}), "
+            f"INP {client_tech.get('inp_ms', 0)}ms ({client_tech.get('inp_status', 'unknown')}). "
+            f"Mobile CWV pass: {client_tech.get('mobile_cwv_pass', 'false')}, "
+            f"Desktop CWV pass: {client_tech.get('desktop_cwv_pass', 'false')}."
+        )
+        
+        keyword_summary = "Top keywords: " + ", ".join([
+            f"{kw['kw']} (pos {kw['pos']}, vol {kw['vol']})" 
+            for kw in client_keywords[:3]
+        ]) if client_keywords else "No keyword data available."
+        
+        gaps_summary = "Keyword gaps: " + ", ".join([
+            f"{gap['kw']} (comp1: {gap['comp1_rank']}, comp2: {gap['comp2_rank']})" 
+            for gap in keyword_gaps[:3]
+        ]) if keyword_gaps else "No keyword gap data available."
+        
+        # Create the executive summary prompt
+        exec_system_prompt = "You are summarizing internal JSON facts for a client SEO report. Use only what you are given. If a datum is missing, do not infer or guess. Respond with 1–2 sentences."
+        exec_prompt = f"""
+        Based on the following real SEO data, write a concise executive summary (max 2 sentences):
+        
+        {tech_summary}
+        
+        {keyword_summary}
+        
+        {gaps_summary}
+        
+        Focus only on the data provided. Do not invent metrics or insights not present in the data.
+        """
+        
+        # Create the competitor commentary prompt
+        comp_system_prompt = "You are summarizing internal JSON facts for a client SEO report. Use only what you are given. If a datum is missing, do not infer or guess. Respond with 1–2 sentences."
+        comp_prompt = f"""
+        Based on the keyword gap analysis below, write a 1-2 sentence competitor commentary:
+        
+        {gaps_summary}
+        
+        Focus only on the data provided. Be specific about the competitive landscape based on the keyword gaps.
+        """
+        
+        # Generate executive summary
+        client = anthropic.Anthropic(api_key=api_key)
+        exec_response = client.messages.create(
+            model="claude-3-haiku-20240307",
+            system=exec_system_prompt,
+            max_tokens=150,
+            temperature=0.7,
+            messages=[
+                {"role": "user", "content": exec_prompt}
+            ]
+        )
+        
+        # Generate competitor commentary
+        comp_response = client.messages.create(
+            model="claude-3-haiku-20240307",
+            system=comp_system_prompt,
+            max_tokens=100,
+            temperature=0.7,
+            messages=[
+                {"role": "user", "content": comp_prompt}
+            ]
+        )
+        
+        return {
+            "executive_summary": exec_response.content[0].text,
+            "competitor_commentary": comp_response.content[0].text
+        }
+    except Exception as e:
+        print(f"[CLAUDE] Summary generation error: {e}")
+        return {"executive_summary": "", "competitor_commentary": ""}
+
+def generate_ai_summary(data: Dict) -> Dict:
+    """Generate AI summaries with fallback from OpenAI to Claude."""
+    # Try OpenAI first
+    summary = ai_summary_openai(data)
+    
+    # If OpenAI fails or returns empty summaries, try Claude
+    if not summary["executive_summary"] or not summary["competitor_commentary"]:
+        claude_summary = ai_summary_claude(data)
+        
+        # Use Claude results for any empty fields
+        if not summary["executive_summary"]:
+            summary["executive_summary"] = claude_summary["executive_summary"]
+        
+        if not summary["competitor_commentary"]:
+            summary["competitor_commentary"] = claude_summary["competitor_commentary"]
+    
+    return summary
 
 def generate_quick_wins(tech_data: Dict) -> List[Dict]:
     """Generate quick win recommendations based on Core Web Vitals data."""
@@ -437,7 +845,7 @@ def generate_quick_wins(tech_data: Dict) -> List[Dict]:
             "issue": "Slow Largest Contentful Paint",
             "evidence_metric": "LCP",
             "evidence_value": f"{lcp_ms} ms",
-            "fix": "Optimize and compress images, implement preloading for critical assets",
+            "fix": "Optimize and compress hero images, implement preloading for critical assets",
             "impact": "high" if lcp_ms > 4000 else "medium",
             "eta_days": 7
         })
@@ -478,23 +886,23 @@ def generate_roadmap(tech_data: Dict, keyword_gaps: List[Dict]) -> Dict:
     
     # Month 1 priorities based on Core Web Vitals
     if tech_data.get("lcp_status") != "pass" or tech_data.get("cls_status") != "pass" or tech_data.get("inp_status") != "pass":
-        roadmap["month_1"].append("Fix Core Web Vitals issues")
+        roadmap["month_1"].append("Fix CWV issues")
     
     if keyword_gaps:
         roadmap["month_1"].append("Target top 3 keyword gaps")
     
     # Month 3 priorities
-    roadmap["month_3"].append("Publish content for identified keyword gaps")
-    roadmap["month_3"].append("Implement internal linking strategy")
+    roadmap["month_3"].append("Publish content for gap topics")
+    roadmap["month_3"].append("Implement internal linking")
     
     # Month 6 priorities
     roadmap["month_6"].append("Scale content production")
-    roadmap["month_6"].append("Review and optimize Core Web Vitals")
+    roadmap["month_6"].append("Review CWV")
     
     return roadmap
 
-def generate_backlink_strategy(keyword_gaps: List[Dict]) -> Dict:
-    """Generate backlink strategy based on keyword gaps."""
+def generate_backlink_strategy(keyword_gaps: List[Dict], prospects: List[Dict]) -> Dict:
+    """Generate backlink strategy based on keyword gaps and prospects."""
     if not keyword_gaps:
         return {
             "strategy": "Insufficient data to generate backlink strategy",
@@ -506,18 +914,45 @@ def generate_backlink_strategy(keyword_gaps: List[Dict]) -> Dict:
     
     strategy = f"Target websites ranking for: {', '.join(topics)}"
     
-    prospects = [
-        {"type": "directory", "why": "Relevant industry listing for targeted keywords"},
-        {"type": "guest post", "why": "Build authority in gap areas"}
-    ]
-    
-    return {
-        "strategy": strategy,
-        "prospects": prospects
-    }
+    # Use actual prospects if available, otherwise use default ones
+    if prospects:
+        return {
+            "strategy": strategy,
+            "prospects": prospects[:5]  # Limit to top 5 prospects
+        }
+    else:
+        return {
+            "strategy": strategy,
+            "prospects": [
+                {"type": "prospect", "why": "Relevant industry listing for targeted keywords"},
+                {"type": "prospect", "why": "Build authority in gap areas"}
+            ]
+        }
 
-def calculate_health_score(tech_data: Dict) -> int:
+def generate_rewrites(url: str, keywords: List[Dict]) -> List[Dict]:
+    """Generate title and meta description rewrites based on keywords."""
+    if not keywords:
+        return []
+    
+    # Extract domain for title
+    domain = urlparse(url).netloc
+    if not domain:
+        domain = url.replace("https://", "").replace("http://", "").split("/")[0]
+    
+    # Use top keyword for rewrite
+    top_kw = keywords[0]["kw"] if keywords else "Your Main Service"
+    
+    return [{
+        "url": "/",
+        "example_title": f"{top_kw.title()} | {domain}",
+        "example_meta": f"Discover {top_kw} solutions that deliver results. Expert {top_kw.lower()} services tailored to your needs."
+    }]
+
+def calculate_health_score(tech_data: Dict) -> str:
     """Calculate a health score based on Core Web Vitals."""
+    if not tech_data or all(v == 0 for k, v in tech_data.items() if isinstance(v, (int, float))):
+        return "—"
+        
     score = 0
     
     # LCP scoring (max 33 points)
@@ -547,7 +982,7 @@ def calculate_health_score(tech_data: Dict) -> int:
     else:
         score += 5
     
-    return score
+    return str(score)
 
 def estimate_domain_metrics(keywords: List[Dict]) -> Dict:
     """Estimate domain metrics based on keyword data."""
@@ -591,72 +1026,11 @@ def estimate_domain_metrics(keywords: List[Dict]) -> Dict:
         traffic = str(int(estimated_traffic))
     
     return {
-        "health": f"{min(100, 50 + kw_count)}%",  # Simple health score based on keyword count
+        "health": "—",  # Will be filled by CWV score
         "da": "—",  # We don't have real DA data
         "traffic": traffic,
         "kw": str(kw_count)
     }
-
-def fetch_on_page_issues(url: str) -> List[Dict]:
-    """Identify basic on-page issues based on a simple fetch."""
-    try:
-        session = create_session("ONPAGE", 5, 8)
-        resp = session.get(url, timeout=(5, 8))
-        html = resp.text.lower()
-        
-        issues = []
-        
-        # Check for H1
-        if "<h1" not in html:
-            issues.append({
-                "url": "/",
-                "issue": "Missing H1 tag",
-                "fix": "Add a unique H1 tag with target keyword"
-            })
-        
-        # Check for title
-        if "<title" not in html:
-            issues.append({
-                "url": "/",
-                "issue": "Missing title tag",
-                "fix": "Add a descriptive title with primary keyword"
-            })
-        
-        # Check for meta description
-        if "meta name=\"description\"" not in html:
-            issues.append({
-                "url": "/",
-                "issue": "Missing meta description",
-                "fix": "Add a compelling meta description with primary keyword"
-            })
-        
-        return issues
-    except Exception as e:
-        print(f"[ONPAGE] Error fetching on-page issues: {e}")
-        return [{
-            "url": "/",
-            "issue": f"Error analyzing page: {str(e)[:100]}",
-            "fix": "Check site accessibility"
-        }]
-
-def generate_rewrites(url: str, keywords: List[Dict]) -> List[Dict]:
-    """Generate title and meta description rewrites based on keywords."""
-    if not keywords:
-        return []
-    
-    # Extract domain for title
-    domain = urlparse(url).netloc
-    if not domain:
-        domain = url.replace("https://", "").replace("http://", "").split("/")[0]
-    
-    # Use top keyword for rewrite
-    top_kw = keywords[0]["kw"] if keywords else "Your Main Service"
-    
-    return [{
-        "url": "/",
-        "example_title": f"{top_kw.title()} | {domain}",
-        "example_meta": f"Discover {top_kw} solutions that deliver results. Expert {top_kw.lower()} services tailored to your needs."
-    }]
 
 # ---------------------------
 # Data Assembly
@@ -745,7 +1119,7 @@ def fetch_all_data(client_url: str, comp1_url: Optional[str] = None, comp2_url: 
             # Combine mobile and desktop data
             data["sites"]["client"]["tech"] = {
                 **tech_mobile,
-                               "mobile_cwv_pass": "true" if all(
+                "mobile_cwv_pass": "true" if all(
                     tech_mobile[k] == "pass" for k in ("lcp_status", "inp_status", "cls_status")
                 ) else "false",
                 "desktop_cwv_pass": "true" if all(
@@ -755,7 +1129,7 @@ def fetch_all_data(client_url: str, comp1_url: Optional[str] = None, comp2_url: 
             
             # Calculate health score
             health_score = calculate_health_score(tech_mobile)
-            data["kpi"]["health_score"] = str(health_score)
+            data["kpi"]["health_score"] = health_score
         except Exception as e:
             print(f"[PSI] Error processing PSI data: {e}")
             # Set default tech data on failure
@@ -795,10 +1169,21 @@ def fetch_all_data(client_url: str, comp1_url: Optional[str] = None, comp2_url: 
         print(f"[TRENDS] Error generating content plan: {e}")
         data["strategy"]["content_plan"] = []
     
-    # 4. On-page issues
+    # 4. On-page issues and hero image
     try:
-        data["on_page"]["issues"] = fetch_on_page_issues(client_url)
+        issues, largest_image = fetch_homepage_issues(client_url)
+        data["on_page"]["issues"] = issues
         data["on_page"]["rewrites"] = generate_rewrites(client_url, client_keywords)
+        
+        # 5. Azure Vision analysis of hero image
+        if largest_image and largest_image.get("src"):
+            azure_endpoint = os.getenv("AZURE_VISION_ENDPOINT")
+            azure_key = os.getenv("AZURE_VISION_API_KEY")
+            
+            if azure_endpoint and azure_key:
+                vision_data = azure_vision_analyze(largest_image["src"], azure_endpoint, azure_key)
+                # We could add this to the payload if needed
+                # data["hero_image"] = {**largest_image, **vision_data}
     except Exception as e:
         print(f"[ONPAGE] Error processing on-page data: {e}")
         data["on_page"]["issues"] = [{
@@ -808,16 +1193,25 @@ def fetch_all_data(client_url: str, comp1_url: Optional[str] = None, comp2_url: 
         }]
         data["on_page"]["rewrites"] = []
     
-    # 5. Generate quick wins based on Core Web Vitals
+    # 6. Backlink prospects from Bing
+    bing_key = os.getenv("BING_SEARCH_KEY")
+    backlink_prospects = []
+    if bing_key:
+        try:
+            backlink_prospects = bing_search_prospects(client_url, client_keywords, bing_key)
+        except Exception as e:
+            print(f"[BING] Error fetching backlink prospects: {e}")
+    
+    # 7. Generate quick wins based on Core Web Vitals
     try:
         data["strategy"]["quick_wins"] = generate_quick_wins(data["sites"]["client"]["tech"])
     except Exception as e:
         print(f"[STRATEGY] Error generating quick wins: {e}")
         data["strategy"]["quick_wins"] = []
     
-    # 6. Generate backlink strategy
+    # 8. Generate backlink strategy
     try:
-        data["strategy"]["backlinks"] = generate_backlink_strategy(data["keywords"]["gaps"])
+        data["strategy"]["backlinks"] = generate_backlink_strategy(data["keywords"]["gaps"], backlink_prospects)
     except Exception as e:
         print(f"[STRATEGY] Error generating backlink strategy: {e}")
         data["strategy"]["backlinks"] = {
@@ -825,7 +1219,7 @@ def fetch_all_data(client_url: str, comp1_url: Optional[str] = None, comp2_url: 
             "prospects": []
         }
     
-    # 7. Generate roadmap
+    # 9. Generate roadmap
     try:
         data["strategy"]["roadmap"] = generate_roadmap(
             data["sites"]["client"]["tech"], 
@@ -839,26 +1233,24 @@ def fetch_all_data(client_url: str, comp1_url: Optional[str] = None, comp2_url: 
             "month_6": ["Review and optimize"]
         }
     
-    # 8. Benchmark data
+    # 10. Benchmark data
     try:
-        data["bench"]["client"] = estimate_domain_metrics(client_keywords)
+        client_metrics = estimate_domain_metrics(client_keywords)
+        client_metrics["health"] = data["kpi"]["health_score"]  # Use CWV health score
+        data["bench"]["client"] = client_metrics
         
-        if comp1_url:
+        if comp1_url and comp1_keywords:
             data["bench"]["comp1"] = estimate_domain_metrics(comp1_keywords)
         
-        if comp2_url:
+        if comp2_url and comp2_keywords:
             data["bench"]["comp2"] = estimate_domain_metrics(comp2_keywords)
     except Exception as e:
         print(f"[BENCH] Error calculating benchmark data: {e}")
         # Keep default benchmark data
     
-    # 9. AI-generated summaries
+    # 11. AI-generated summaries
     try:
-        ai_summaries = generate_ai_summary(
-            data,
-            {"keywords": {"top": comp1_keywords}},
-            {"keywords": {"top": comp2_keywords}}
-        )
+        ai_summaries = generate_ai_summary(data)
         
         data["strategy"]["executive_summary"] = ai_summaries["executive_summary"]
         data["strategy"]["competitor_commentary"] = ai_summaries["competitor_commentary"]
@@ -979,22 +1371,6 @@ def report_full():
     if not client_url:
         return "Add ?url=example.com&comp1=competitor1.com&comp2=competitor2.com", 400
     
-    # Check required API keys
-    missing_keys = []
-    if not os.getenv("GOOGLE_PAGESPEED_API_KEY"):
-        missing_keys.append("GOOGLE_PAGESPEED_API_KEY")
-    if not os.getenv("SERPSTACK_API_KEY"):
-        missing_keys.append("SERPSTACK_API_KEY")
-    if not os.getenv("OPENAI_API_KEY"):
-        missing_keys.append("OPENAI_API_KEY")
-    
-    if missing_keys:
-        # Create a basic report noting the missing keys
-        data = create_base_payload(client_url)
-        data["strategy"]["executive_summary"] = f"Missing required API keys: {', '.join(missing_keys)}"
-        filled_html = render_template_with_data(data)
-        return Response(filled_html, mimetype="text/html")
-    
     # Fetch all data and render the report
     try:
         data = fetch_all_data(client_url, comp1_url, comp2_url)
@@ -1052,8 +1428,8 @@ def api_keywords():
         print(f"[API] Error in /api/keywords: {e}")
         return jsonify({"ok": False, "error": str(e), "domain": domain, "keywords": []}), 200  # Return 200 with error info
 
-@app.route("/api/cwv", methods=["GET"])
-def api_cwv():
+@app.route("/api/pagespeed", methods=["GET"])
+def api_pagespeed():
     """API endpoint to fetch Core Web Vitals for a URL."""
     url = request.args.get("url", "").strip()
     if not url:
@@ -1073,7 +1449,7 @@ def api_cwv():
             "desktop": desktop
         })
     except Exception as e:
-        print(f"[API] Error in /api/cwv: {e}")
+        print(f"[API] Error in /api/pagespeed: {e}")
         return jsonify({
             "ok": False,
             "error": str(e),
@@ -1093,12 +1469,14 @@ def api_cwv():
 @app.route("/api/trends", methods=["GET"])
 def api_trends():
     """API endpoint to fetch Google Trends data for keywords."""
-    keywords = request.args.get("keywords", "").strip().split(",")
-    if not keywords or keywords[0] == "":
+    keywords_str = request.args.get("keywords", "").strip()
+    if not keywords_str:
         return jsonify({"ok": False, "error": "Missing keywords parameter"}), 400
     
+    keywords = keywords_str.split(",")
+    
     try:
-        keyword_data = [{"kw": kw} for kw in keywords]
+        keyword_data = [{"kw": kw.strip()} for kw in keywords if kw.strip()]
         trends = get_trends_data(keyword_data)
         
         return jsonify({
@@ -1114,6 +1492,57 @@ def api_trends():
             "keywords": keywords,
             "trends": []
         }), 200  # Return 200 with error info
+
+@app.route("/report/pdf")
+def report_pdf():
+    """Optional: Generate PDF from HTML report using PDFShift or similar service."""
+    # This is an optional endpoint - if PDFShift API key is not set, just redirect to HTML version
+    pdfshift_api_key = os.getenv("PDFSHIFT_API_KEY")
+    if not pdfshift_api_key:
+        # Redirect to HTML report
+        return redirect(url_for('report_full', **request.args))
+    
+    client_url = request.args.get("url", "").strip()
+    comp1_url = request.args.get("comp1", "").strip()
+    comp2_url = request.args.get("comp2", "").strip()
+    
+    if not client_url:
+        return "Add ?url=example.com&comp1=competitor1.com&comp2=competitor2.com", 400
+    
+    try:
+        # Generate the HTML report
+        data = fetch_all_data(client_url, comp1_url, comp2_url)
+        html_content = render_template_with_data(data)
+        
+        if html_content.startswith("Template not found"):
+            return html_content, 404
+        
+        # Convert HTML to PDF using PDFShift
+        response = requests.post(
+            'https://api.pdfshift.io/v3/convert/pdf',
+            auth=(pdfshift_api_key, ''),
+            json={
+                'source': html_content,
+                'landscape': False,
+                'format': 'A4',
+                'margin': '20mm'
+            },
+            timeout=(5, 30)  # PDF generation might take longer
+        )
+        response.raise_for_status()
+        
+        # Return the PDF
+        return Response(
+            response.content,
+            mimetype='application/pdf',
+            headers={
+                'Content-Disposition': f'attachment; filename=seo_report_{client_url.replace("https://", "").replace("http://", "").split("/")[0]}.pdf'
+            }
+        )
+    except Exception as e:
+        print(f"[PDF] Error generating PDF: {e}")
+        # Fallback to HTML version
+        return redirect(url_for('report_full', **request.args))
 
 # Local debug (Render uses gunicorn via Procfile)
 if __name__ == "__main__":
